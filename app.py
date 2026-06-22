@@ -6,30 +6,95 @@ from google import genai
 import gradio as gr
 
 # --- Configuration ---
-MAX_DURATION_SECONDS = 420 
-# It will dynamically pull this from the cloud environment or your system terminal
+MAX_DURATION_SECONDS = 420
+# Securely grabs the key from your Hugging Face Secrets
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+
+# --- Shared yt-dlp options factory ---
+def get_ydl_opts(extra=None):
+    """
+    Returns a base yt-dlp options dict tuned for cloud server environments
+    (Hugging Face Spaces). Uses mobile/Android clients to avoid YouTube's
+    bot-detection and SSL connection drops that affect cloud IPs.
+    """
+    opts = {
+        # Use Android client first, fall back to iOS then mweb.
+        # These bypass YouTube bot-detection far better than tvhtml5embedded
+        # on cloud servers, and avoid SSL UNEXPECTED_EOF errors.
+        'extractor_args': {
+            'youtube': {
+                'client': ['android', 'ios', 'mweb'],
+            }
+        },
+        # Mimic Android YouTube app user-agent for the android client
+        'http_headers': {
+            'User-Agent': (
+                'com.google.android.youtube/19.09.37 '
+                '(Linux; U; Android 11) gzip'
+            ),
+        },
+        # SSL / network resilience
+        'nocheckcertificate': True,   # handles SSL EOF / cert errors on cloud
+        'socket_timeout': 30,
+        'retries': 5,
+        'fragment_retries': 5,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def _parse_ydl_error(e):
+    """
+    Safely stringify a yt-dlp exception, which can sometimes produce an
+    empty str(e) when the DownloadError wraps another exception.
+    """
+    msg = str(e).strip()
+    # Strip the redundant "ERROR: " prefix yt-dlp adds
+    if msg.startswith("ERROR: "):
+        msg = msg[7:]
+    return msg or "Unknown extraction error. Please check the URL and try again."
+
 
 # --- Core Processing Functions ---
 def check_video_duration(youtube_url):
     """Fetches video metadata to check duration without downloading the media."""
-    ydl_opts = {'quiet': True, 'simulate': True}
+    ydl_opts = get_ydl_opts({'skip_download': True})
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(youtube_url, download=False)
             video_duration = info_dict.get('duration', 0)
-            
+
             if video_duration > MAX_DURATION_SECONDS:
-                return False, f"Video is too long ({video_duration} seconds). Please use a video under 7 minutes to protect server memory."
-            
+                return False, (
+                    f"Video is too long ({video_duration} seconds). "
+                    "Please use a video under 7 minutes to protect server memory."
+                )
+
             return True, video_duration
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = _parse_ydl_error(e)
+        if "Sign in" in error_msg or "confirm your age" in error_msg:
+            return False, (
+                "⚠️ YouTube requires sign-in for this video. "
+                "Please try a different, publicly accessible video."
+            )
+        if "SSL" in error_msg or "EOF" in error_msg:
+            return False, (
+                "⚠️ YouTube blocked the cloud server's SSL connection. "
+                "Please wait a moment and try again, or try a different video."
+            )
+        return False, f"Invalid URL or extraction error: {error_msg}"
     except Exception as e:
-        return False, f"Invalid URL or extraction error: {str(e)}"
+        return False, f"Unexpected error: {_parse_ydl_error(e)}"
 
 def download_audio(youtube_url):
     """Downloads the best audio stream and converts it to an MP3 file."""
     output_filename = "temp_audio"
-    ydl_opts = {
+    extra = {
         'format': 'bestaudio/best',
         'outtmpl': f'{output_filename}.%(ext)s',
         'postprocessors': [{
@@ -37,14 +102,27 @@ def download_audio(youtube_url):
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'quiet': True, 
     }
+    ydl_opts = get_ydl_opts(extra)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([youtube_url])
             return True, f"{output_filename}.mp3"
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = _parse_ydl_error(e)
+        if "Sign in" in error_msg or "confirm your age" in error_msg:
+            return False, (
+                "⚠️ YouTube requires sign-in for this video. "
+                "Please try a different, publicly accessible video."
+            )
+        if "SSL" in error_msg or "EOF" in error_msg:
+            return False, (
+                "⚠️ YouTube blocked the cloud server's SSL connection during download. "
+                "Please wait a moment and try again."
+            )
+        return False, f"Download failed: {error_msg}"
     except Exception as e:
-        return False, f"Download failed: {str(e)}"
+        return False, f"Unexpected download error: {_parse_ydl_error(e)}"
 
 def transcribe_audio(audio_file_path):
     """Loads the local Whisper model and transcribes the audio file."""
@@ -88,7 +166,6 @@ def main_ui_pipeline(youtube_url):
     # Step 1: Validate duration
     is_valid, duration_result = check_video_duration(youtube_url)
     if not is_valid:
-        # This triggers a clean, red alert banner on the user's screen
         raise gr.Error(duration_result)
         
     # Step 2: Download Audio stream
@@ -132,10 +209,8 @@ with gr.Blocks(title="AI YouTube Summarizer") as demo:
         
     submit_btn = gr.Button("🚀 Generate Summary", variant="primary")
     
-    # We use a Markdown output component so that Gemini's bullet points and bold headings render beautifully
     output_markdown = gr.Markdown()
 
-    # Bind the button action to our main pipeline function
     submit_btn.click(
         fn=main_ui_pipeline, 
         inputs=url_input, 
@@ -144,5 +219,4 @@ with gr.Blocks(title="AI YouTube Summarizer") as demo:
 
 # --- App Launch Engine ---
 if __name__ == "__main__":
-    # Launching local development environment web server
     demo.launch()

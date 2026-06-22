@@ -2,3 +2,5 @@ yt-dlp
 openai-whisper
 gradio
 google-genai
+curl-cffi
+requests
