@@ -1,0 +1,148 @@
+# --- Imports ---
+import yt_dlp
+import whisper
+import os
+from google import genai
+import gradio as gr
+
+# --- Configuration ---
+MAX_DURATION_SECONDS = 420 
+# It will dynamically pull this from the cloud environment or your system terminal
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# --- Core Processing Functions ---
+def check_video_duration(youtube_url):
+    """Fetches video metadata to check duration without downloading the media."""
+    ydl_opts = {'quiet': True, 'simulate': True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(youtube_url, download=False)
+            video_duration = info_dict.get('duration', 0)
+            
+            if video_duration > MAX_DURATION_SECONDS:
+                return False, f"Video is too long ({video_duration} seconds). Please use a video under 7 minutes to protect server memory."
+            
+            return True, video_duration
+    except Exception as e:
+        return False, f"Invalid URL or extraction error: {str(e)}"
+
+def download_audio(youtube_url):
+    """Downloads the best audio stream and converts it to an MP3 file."""
+    output_filename = "temp_audio"
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': f'{output_filename}.%(ext)s',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': True, 
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+            return True, f"{output_filename}.mp3"
+    except Exception as e:
+        return False, f"Download failed: {str(e)}"
+
+def transcribe_audio(audio_file_path):
+    """Loads the local Whisper model and transcribes the audio file."""
+    try:
+        model = whisper.load_model("tiny")
+        result = model.transcribe(audio_file_path)
+        transcript_text = result.get("text", "").strip()
+        return True, transcript_text
+    except Exception as e:
+        return False, f"Transcription failed: {str(e)}"
+
+def generate_summary(transcript_text):
+    """Sends the raw transcript to Gemini to generate structured bullet points."""
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        prompt = (
+            "You are an expert content summarizer. Below is a raw text transcript extracted "
+            "from a YouTube video. Please analyze it thoroughly and generate a clean, "
+            "comprehensive summary of the core concepts using bullet points. Use bold headers "
+            "where necessary to organize different topics logically.\n\n"
+            f"Transcript text:\n{transcript_text}"
+        )
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return True, response.text
+    except Exception as e:
+        return False, f"Summarization failed: {str(e)}"
+
+# --- Main Gradio Orchestrator Pipeline ---
+def main_ui_pipeline(youtube_url):
+    """
+    Ties all backend functions together and updates the web UI with statuses/errors.
+    """
+    if not youtube_url.strip():
+        raise gr.Error("Please enter a valid YouTube URL!")
+
+    # Step 1: Validate duration
+    is_valid, duration_result = check_video_duration(youtube_url)
+    if not is_valid:
+        # This triggers a clean, red alert banner on the user's screen
+        raise gr.Error(duration_result)
+        
+    # Step 2: Download Audio stream
+    gr.Info("⬇️ Fetching video and downloading audio stream... Please wait.")
+    download_success, file_result = download_audio(youtube_url)
+    if not download_success:
+        raise gr.Error(file_result)
+        
+    # Step 3: Local Whisper Transcription
+    gr.Info("🎙️ Audio downloaded successfully! Running speech-to-text transcription engine...")
+    transcribe_success, transcript_result = transcribe_audio(file_result)
+    
+    # Instant local file deletion cleanup right after transcribing
+    if os.path.exists(file_result):
+        os.remove(file_result)
+        
+    if not transcribe_success:
+        raise gr.Error(transcript_result)
+        
+    # Step 4: LLM Analysis & Bulleted Generation
+    gr.Info("🧠 Processing transcript text with Gemini AI to extract core concepts...")
+    summary_success, summary_result = generate_summary(transcript_result)
+    if not summary_success:
+        raise gr.Error(summary_result)
+        
+    # Everything succeeded! Return the markdown response text directly to the UI panel
+    return summary_result
+
+# --- Gradio UI Layout Building ---
+with gr.Blocks(title="AI YouTube Summarizer") as demo:
+    gr.Markdown("# 🎥 Automated YouTube Video Summarizer")
+    gr.Markdown("Paste a YouTube link below to download its audio, convert speech to text, and get a structured summary.")
+    gr.Markdown("> **Note:** To prevent server memory exhaustion, maximum video length is strictly capped at **7 minutes**.")
+    
+    with gr.Row():
+        url_input = gr.Textbox(
+            label="YouTube Video Link", 
+            placeholder="https://www.youtube.com/watch?v=...", 
+            lines=1
+        )
+        
+    submit_btn = gr.Button("🚀 Generate Summary", variant="primary")
+    
+    # We use a Markdown output component so that Gemini's bullet points and bold headings render beautifully
+    output_markdown = gr.Markdown()
+
+    # Bind the button action to our main pipeline function
+    submit_btn.click(
+        fn=main_ui_pipeline, 
+        inputs=url_input, 
+        outputs=output_markdown
+    )
+
+# --- App Launch Engine ---
+if __name__ == "__main__":
+    # Launching local development environment web server
+    demo.launch()
